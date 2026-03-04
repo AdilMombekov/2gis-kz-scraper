@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python scraper.py"
-restartPolicyType = "never"
+startCommand = "python bot.py"
+restartPolicyType = "on_failure"
