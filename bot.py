@@ -45,7 +45,7 @@ from parser_2gis import (
 from google_sheets import (
     _get_service, get_spreadsheet_id,
     ensure_header, get_existing_ids, get_existing_rows,
-    append_rows, update_row,
+    append_rows, update_row, get_or_create_safe_sheet,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -116,10 +116,11 @@ def _run_scraper(chat_id: int):
 
         service = _get_service()
         spreadsheet_id = get_spreadsheet_id()
-        ensure_header(service, spreadsheet_id, SHEET_NAME)
+        sheet = get_or_create_safe_sheet(service, spreadsheet_id, "Data")
+        ensure_header(service, spreadsheet_id, sheet)
 
         log("Загружаю существующие ID из таблицы...")
-        seen_ids = get_existing_ids(service, spreadsheet_id, SHEET_NAME)
+        seen_ids = get_existing_ids(service, spreadsheet_id, sheet)
         with _state_lock:
             _state["total_in_sheet"] = len(seen_ids)
         log(f"Уже в таблице: {len(seen_ids)} записей\nНачинаю парсинг {len(CITIES_KZ)} городов...")
@@ -149,7 +150,7 @@ def _run_scraper(chat_id: int):
                         pass
             for r in batch:
                 r["coordinates"] = f"{r.get('lat') or ''},{r.get('lon') or ''}".strip(",")
-            written = append_rows(service, spreadsheet_id, batch, SHEET_NAME)
+            written = append_rows(service, spreadsheet_id, batch, sheet)
             total_written += written
             with _state_lock:
                 _state["total_new"] = total_written
@@ -320,9 +321,9 @@ def cmd_count(message):
     try:
         service = _get_service()
         sid = get_spreadsheet_id()
-        sname = f"'{SHEET_NAME}'" if " " in SHEET_NAME else SHEET_NAME
+        sheet = get_or_create_safe_sheet(service, sid, "Data")
         result = service.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"{sname}!A:A"
+            spreadsheetId=sid, range=f"'{sheet}'!A:A"
         ).execute()
         rows = result.get("values", [])
         bot.reply_to(message, f"📊 Записей в таблице: {len(rows) - 1}")
@@ -353,9 +354,9 @@ def cmd_clear(message):
     try:
         service = _get_service()
         sid = get_spreadsheet_id()
-        sname = f"'{SHEET_NAME}'" if " " in SHEET_NAME else SHEET_NAME
+        sheet = get_or_create_safe_sheet(service, sid, "Data")
         service.spreadsheets().values().clear(
-            spreadsheetId=sid, range=f"{sname}!A2:Z"
+            spreadsheetId=sid, range=f"'{sheet}'!A2:Z"
         ).execute()
         bot.reply_to(message, "✅ Таблица очищена. Заголовок сохранён.")
     except Exception as e:
@@ -378,11 +379,12 @@ def _run_fix(chat_id: int):
 
         service = _get_service()
         spreadsheet_id = get_spreadsheet_id()
+        sheet = get_or_create_safe_sheet(service, spreadsheet_id, "Data")
         city_list = list(CITIES_KZ.items())
         city_slug_by_city = dict(city_list)
 
         log("Читаю таблицу...")
-        all_rows = get_existing_rows(service, spreadsheet_id, SHEET_NAME)
+        all_rows = get_existing_rows(service, spreadsheet_id, sheet)
         # Строки у которых нет координат
         need_fix = [r for r in all_rows if not r.get("lat") or not r.get("lon")]
         log(f"Всего строк: {len(all_rows)}\nНужно дозаполнить: {len(need_fix)}")
@@ -399,7 +401,7 @@ def _run_fix(chat_id: int):
             try:
                 _fetch_firm_data(row, slug, BASE_2GIS_KZ, DELAY)
                 row["coordinates"] = f"{row.get('lat') or ''},{row.get('lon') or ''}".strip(",")
-                update_row(service, spreadsheet_id, row["_row_index"], row, SHEET_NAME)
+                update_row(service, spreadsheet_id, row["_row_index"], row, sheet)
                 fixed += 1
             except Exception as e:
                 log(f"⚠️ Ошибка строки {row.get('id_2gis')}: {e}")

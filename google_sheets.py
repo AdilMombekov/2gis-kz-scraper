@@ -24,10 +24,37 @@ COLUMNS = ["id_2gis", "name", "address", "city", "lat", "lon", "coordinates", "p
 
 
 def _sheet_range(sheet_name: str, range_: str) -> str:
-    """Формирует корректный range с именем листа. Оборачивает в кавычки если есть пробел."""
-    if " " in sheet_name:
-        return f"'{sheet_name}'!{range_}"
-    return f"{sheet_name}!{range_}"
+    """Формирует корректный range с именем листа."""
+    # Google Sheets API требует одинарные кавычки вокруг имён с пробелами/спецсимволами
+    # Но передаём через escaped имя — заменяем одинарные кавычки на двойные внутри
+    safe = sheet_name.replace("'", "''")
+    return f"'{safe}'!{range_}"
+
+
+def get_or_create_safe_sheet(service, spreadsheet_id: str, preferred_name: str = "Data") -> str:
+    """
+    Возвращает имя листа без пробелов и кириллицы.
+    Если лист с таким именем не существует — переименовывает первый лист.
+    """
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheets = meta.get("sheets", [])
+
+    # Ищем лист с нужным именем
+    for s in sheets:
+        if s["properties"]["title"] == preferred_name:
+            return preferred_name
+
+    # Берём первый лист и переименовываем
+    first_sheet_id = sheets[0]["properties"]["sheetId"]
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": first_sheet_id, "title": preferred_name},
+            "fields": "title"
+        }}]}
+    ).execute()
+    print(f"Лист переименован в '{preferred_name}'", flush=True)
+    return preferred_name
 
 
 def _get_service():
