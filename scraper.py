@@ -44,15 +44,8 @@ BATCH_SIZE  = int(os.environ.get("BATCH_SIZE", 50))
 SHEET_NAME  = os.environ.get("SHEET_NAME", "Лист1")
 
 
-_logfile = open(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "scraper_log.txt"),
-    "w", encoding="utf-8", buffering=1
-)
-
 def log(msg: str) -> None:
     print(msg, flush=True)
-    _logfile.write(msg + "\n")
-    _logfile.flush()
 
 
 def scrape_one_city(city_name: str, city_slug: str) -> list:
