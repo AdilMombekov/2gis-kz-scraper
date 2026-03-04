@@ -63,21 +63,68 @@ def ensure_header(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> N
         print("Заголовки записаны в строку 1.", flush=True)
 
 
-def get_existing_ids(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> set:
-    """Читает все id_2gis из столбца A (начиная со строки 2). Нормализует числовой формат."""
+def _normalize_id(raw_id: str) -> str:
+    """Нормализует ID — убирает форматирование Google Sheets (пробелы, запятые, апостроф)."""
+    return str(raw_id).lstrip("'").replace("\xa0", "").replace(" ", "").replace(",", "").replace(".", "").strip()
+
+
+def get_existing_rows(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> list:
+    """
+    Читает все строки из таблицы (начиная со строки 2).
+    Возвращает список dict с ключами по COLUMNS + '_row_index' (1-based номер строки).
+    """
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"{sheet_name}!A2:A",
+        range=f"{sheet_name}!A2:K",
     ).execute()
     values = result.get("values", [])
+    rows = []
+    for i, row in enumerate(values):
+        # Дополняем до длины COLUMNS
+        padded = row + [""] * (len(COLUMNS) - len(row))
+        d = dict(zip(COLUMNS, padded))
+        d["id_2gis"] = _normalize_id(d["id_2gis"])
+        d["_row_index"] = i + 2  # строка в таблице (1-based, +1 за заголовок)
+        rows.append(d)
+    return rows
+
+
+def get_existing_ids(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> set:
+    """Читает все id_2gis из столбца A (начиная со строки 2). Нормализует числовой формат."""
+    rows = get_existing_rows(service, spreadsheet_id, sheet_name)
     ids = set()
-    for row in values:
-        if row:
-            # Убираем пробелы и запятые которые Google Sheets добавляет к числам
-            raw = str(row[0]).replace("\xa0", "").replace(" ", "").replace(",", "").replace(".", "").strip()
-            ids.add(raw)
-            ids.add(row[0])  # оригинал тоже
+    for row in rows:
+        nid = row["id_2gis"]
+        if nid:
+            ids.add(nid)
     return ids
+
+
+def update_row(service, spreadsheet_id: str, row_index: int, data: dict, sheet_name: str = "Sheet1") -> None:
+    """Обновляет одну строку в таблице по номеру строки (1-based)."""
+    row_vals = []
+    for col in COLUMNS:
+        val = str(data.get(col, "") or "")
+        if col == "id_2gis" and val.isdigit():
+            val = "'" + val
+        row_vals.append(val)
+    range_ = f"{sheet_name}!A{row_index}:K{row_index}"
+    for attempt in range(5):
+        try:
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=range_,
+                valueInputOption="RAW",
+                body={"values": [row_vals]},
+            ).execute()
+            return
+        except HttpError as e:
+            if e.resp.status == 429:
+                wait = 60 * (attempt + 1)
+                print(f"  Rate limit, ждём {wait}с...", flush=True)
+                time.sleep(wait)
+            else:
+                raise
 
 
 def append_rows(service, spreadsheet_id: str, rows: List[Dict], sheet_name: str = "Sheet1") -> int:

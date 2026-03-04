@@ -4,7 +4,8 @@ Telegram-бот для управления парсером 2GIS KZ -> Google S
 
 Команды:
   /start   — приветствие
-  /run     — запустить полный парсинг
+  /run     — запустить полный парсинг (новые записи добавляются, существующие пропускаются)
+  /fix     — дозаполнить координаты/телефон для строк у которых они пустые
   /stop    — остановить парсинг
   /status  — текущий статус (работает / не работает, сколько собрано)
   /count   — сколько записей сейчас в таблице
@@ -43,7 +44,8 @@ from parser_2gis import (
 )
 from google_sheets import (
     _get_service, get_spreadsheet_id,
-    ensure_header, get_existing_ids, append_rows,
+    ensure_header, get_existing_ids, get_existing_rows,
+    append_rows, update_row,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -241,6 +243,8 @@ def cmd_start(message):
         "🌸 2GIS KZ Flower Scraper\n\n"
         "Команды:\n"
         "/run — запустить полный парсинг\n"
+        "       (существующие записи пропускаются)\n"
+        "/fix — дозаполнить пустые координаты/телефон\n"
         "/stop — остановить парсинг\n"
         "/status — текущий статус\n"
         "/count — кол-во записей в таблице\n"
@@ -354,6 +358,79 @@ def cmd_clear(message):
         bot.reply_to(message, "✅ Таблица очищена. Заголовок сохранён.")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
+
+
+def _run_fix(chat_id: int):
+    """Дозаполняет координаты/телефон/соцсети для строк у которых они пустые."""
+    def log(msg):
+        try:
+            bot.send_message(chat_id, msg)
+        except Exception:
+            pass
+
+    try:
+        with _state_lock:
+            _state["running"] = True
+            _state["stop_flag"] = False
+            _state["started_at"] = time.time()
+
+        service = _get_service()
+        spreadsheet_id = get_spreadsheet_id()
+        city_list = list(CITIES_KZ.items())
+        city_slug_by_city = dict(city_list)
+
+        log("Читаю таблицу...")
+        all_rows = get_existing_rows(service, spreadsheet_id, SHEET_NAME)
+        # Строки у которых нет координат
+        need_fix = [r for r in all_rows if not r.get("lat") or not r.get("lon")]
+        log(f"Всего строк: {len(all_rows)}\nНужно дозаполнить: {len(need_fix)}")
+
+        if not need_fix:
+            log("✅ Все строки уже заполнены!")
+            return
+
+        fixed = 0
+        for i, row in enumerate(need_fix):
+            if _state["stop_flag"]:
+                break
+            slug = city_slug_by_city.get(row.get("city", ""), city_list[0][1])
+            try:
+                _fetch_firm_data(row, slug, BASE_2GIS_KZ, DELAY)
+                row["coordinates"] = f"{row.get('lat') or ''},{row.get('lon') or ''}".strip(",")
+                update_row(service, spreadsheet_id, row["_row_index"], row, SHEET_NAME)
+                fixed += 1
+            except Exception as e:
+                log(f"⚠️ Ошибка строки {row.get('id_2gis')}: {e}")
+            if (i + 1) % 50 == 0:
+                log(f"⚙️ Обработано {i+1}/{len(need_fix)}, исправлено: {fixed}")
+            time.sleep(DELAY)
+
+        log(f"✅ Готово! Дозаполнено: {fixed}/{len(need_fix)} строк\nВремя: {_elapsed()}")
+
+    except Exception as e:
+        try:
+            bot.send_message(chat_id, f"❌ Ошибка /fix:\n{e}\n{traceback.format_exc()[:800]}")
+        except Exception:
+            pass
+    finally:
+        with _state_lock:
+            _state["running"] = False
+            _state["stop_flag"] = False
+
+
+@bot.message_handler(commands=["fix"])
+def cmd_fix(message):
+    if not _allowed(message):
+        return
+    with _state_lock:
+        if _state["running"]:
+            bot.reply_to(message, "⚙️ Уже что-то работает. /status — посмотреть.")
+            return
+    bot.reply_to(message, "🔧 Запускаю дозаполнение пустых координат/телефонов...")
+    t = threading.Thread(target=_run_fix, args=(message.chat.id,), daemon=True)
+    with _state_lock:
+        _state["thread"] = t
+    t.start()
 
 
 if __name__ == "__main__":
