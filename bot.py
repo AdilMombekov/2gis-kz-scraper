@@ -320,8 +320,9 @@ def cmd_count(message):
     try:
         service = _get_service()
         sid = get_spreadsheet_id()
+        sname = f"'{SHEET_NAME}'" if " " in SHEET_NAME else SHEET_NAME
         result = service.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"{SHEET_NAME}!A:A"
+            spreadsheetId=sid, range=f"{sname}!A:A"
         ).execute()
         rows = result.get("values", [])
         bot.reply_to(message, f"📊 Записей в таблице: {len(rows) - 1}")
@@ -352,8 +353,9 @@ def cmd_clear(message):
     try:
         service = _get_service()
         sid = get_spreadsheet_id()
+        sname = f"'{SHEET_NAME}'" if " " in SHEET_NAME else SHEET_NAME
         service.spreadsheets().values().clear(
-            spreadsheetId=sid, range=f"{SHEET_NAME}!A2:Z"
+            spreadsheetId=sid, range=f"{sname}!A2:Z"
         ).execute()
         bot.reply_to(message, "✅ Таблица очищена. Заголовок сохранён.")
     except Exception as e:

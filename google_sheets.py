@@ -23,6 +23,13 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 COLUMNS = ["id_2gis", "name", "address", "city", "lat", "lon", "coordinates", "phone", "instagram", "facebook", "telegram"]
 
 
+def _sheet_range(sheet_name: str, range_: str) -> str:
+    """Формирует корректный range с именем листа. Оборачивает в кавычки если есть пробел."""
+    if " " in sheet_name:
+        return f"'{sheet_name}'!{range_}"
+    return f"{sheet_name}!{range_}"
+
+
 def _get_service():
     """Создаёт авторизованный сервис Google Sheets API."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -47,8 +54,8 @@ def get_spreadsheet_id() -> str:
 
 
 def ensure_header(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> None:
-    """Если строка 1 пустая — записывает заголовки. Всегда пишет данные как текст (USER_ENTERED)."""
-    range_ = f"{sheet_name}!A1:K1"
+    """Если строка 1 пустая — записывает заголовки."""
+    range_ = _sheet_range(sheet_name, "A1:K1")
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range=range_
     ).execute()
@@ -75,7 +82,7 @@ def get_existing_rows(service, spreadsheet_id: str, sheet_name: str = "Sheet1") 
     """
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"{sheet_name}!A2:K",
+        range=_sheet_range(sheet_name, "A2:K"),
     ).execute()
     values = result.get("values", [])
     rows = []
@@ -91,12 +98,17 @@ def get_existing_rows(service, spreadsheet_id: str, sheet_name: str = "Sheet1") 
 
 def get_existing_ids(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> set:
     """Читает все id_2gis из столбца A (начиная со строки 2). Нормализует числовой формат."""
-    rows = get_existing_rows(service, spreadsheet_id, sheet_name)
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=_sheet_range(sheet_name, "A2:A"),
+    ).execute()
+    values = result.get("values", [])
     ids = set()
-    for row in rows:
-        nid = row["id_2gis"]
-        if nid:
-            ids.add(nid)
+    for row in values:
+        if row:
+            nid = _normalize_id(row[0])
+            if nid:
+                ids.add(nid)
     return ids
 
 
@@ -108,7 +120,7 @@ def update_row(service, spreadsheet_id: str, row_index: int, data: dict, sheet_n
         if col == "id_2gis" and val.isdigit():
             val = "'" + val
         row_vals.append(val)
-    range_ = f"{sheet_name}!A{row_index}:K{row_index}"
+    range_ = _sheet_range(sheet_name, f"A{row_index}:K{row_index}")
     for attempt in range(5):
         try:
             service.spreadsheets().values().update(
@@ -150,7 +162,7 @@ def append_rows(service, spreadsheet_id: str, rows: List[Dict], sheet_name: str 
         try:
             service.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!A1",
+                range=_sheet_range(sheet_name, "A1"),
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body=body,
