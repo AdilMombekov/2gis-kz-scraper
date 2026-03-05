@@ -516,6 +516,80 @@ def cmd_log10h(message):
     bot.reply_to(message, _format_log_report(10))
 
 
+@bot.message_handler(commands=["test"])
+def cmd_test(message):
+    if not _allowed(message):
+        return
+    bot.reply_to(message, "🔍 Тестирую API и HTML парсинг для Алматы / цветы...")
+
+    import requests as _req
+    results = []
+
+    # Тест 1: Catalog API
+    try:
+        r = _req.get(
+            "https://catalog.api.2gis.com/3.0/items",
+            params={"key": "demos", "q": "цветы", "type": "branch",
+                    "locale": "ru_KZ", "page": 1, "page_size": 5},
+            timeout=15,
+        )
+        data = r.json()
+        total = data.get("result", {}).get("total", "?")
+        items = data.get("result", {}).get("items", [])
+        results.append(f"✅ Catalog API (без region_id):\nstatus={r.status_code}, total={total}, items={len(items)}")
+        if items:
+            results.append(f"  Первый: {items[0].get('name','?')} | id={items[0].get('id','?')}")
+        else:
+            results.append(f"  Ответ: {str(data)[:300]}")
+    except Exception as e:
+        results.append(f"❌ Catalog API ошибка: {e}")
+
+    # Тест 2: API с region_id Алматы
+    try:
+        r2 = _req.get(
+            "https://catalog.api.2gis.com/2.0/region/list",
+            params={"key": "demos", "q": "almaty", "locale": "ru_KZ"},
+            timeout=15,
+        )
+        rdata = r2.json()
+        reg_items = rdata.get("result", {}).get("items", [])
+        if reg_items:
+            rid = reg_items[0].get("id")
+            results.append(f"✅ Region API: almaty region_id={rid}")
+            r3 = _req.get(
+                "https://catalog.api.2gis.com/3.0/items",
+                params={"key": "demos", "q": "цветы", "type": "branch",
+                        "locale": "ru_KZ", "region_id": rid, "page": 1, "page_size": 5},
+                timeout=15,
+            )
+            d3 = r3.json()
+            total3 = d3.get("result", {}).get("total", "?")
+            items3 = d3.get("result", {}).get("items", [])
+            results.append(f"  С region_id: total={total3}, items={len(items3)}")
+            if items3:
+                results.append(f"  Первый: {items3[0].get('name','?')}")
+            else:
+                results.append(f"  Ответ: {str(d3)[:300]}")
+        else:
+            results.append(f"❌ Region API пустой: {str(rdata)[:200]}")
+    except Exception as e:
+        results.append(f"❌ Region API ошибка: {e}")
+
+    # Тест 3: HTML страница
+    try:
+        from parser_2gis import HEADERS
+        r4 = _req.get("https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
+                      headers=HEADERS, timeout=15)
+        html = r4.text
+        firm_count = html.count("/firm/")
+        script_count = html.count("<script")
+        results.append(f"✅ HTML 2gis.kz: status={r4.status_code}, /firm/ упоминаний={firm_count}, <script>={script_count}, размер={len(html)}")
+    except Exception as e:
+        results.append(f"❌ HTML ошибка: {e}")
+
+    bot.send_message(message.chat.id, "\n".join(results))
+
+
 if __name__ == "__main__":
     print("Bot started...", flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
