@@ -41,6 +41,7 @@ except ImportError:
 from parser_2gis import (
     BASE_2GIS_KZ, CITIES_KZ, FLOWER_QUERIES_KZ,
     get_search_page, parse_search_results, _fetch_firm_data,
+    read_log_since,
 )
 from google_sheets import (
     _get_service, get_spreadsheet_id,
@@ -251,6 +252,9 @@ def cmd_start(message):
         "/count — кол-во записей в таблице\n"
         "/sheet — ссылка на таблицу\n"
         "/clear — очистить таблицу\n"
+        "/log2h — что добавлено за последние 2 часа\n"
+        "/log5h — что добавлено за последние 5 часов\n"
+        "/log10h — что добавлено за последние 10 часов\n"
         "/help — эта справка"
     ))
 
@@ -435,6 +439,57 @@ def cmd_fix(message):
     with _state_lock:
         _state["thread"] = t
     t.start()
+
+
+def _format_log_report(hours: float) -> str:
+    """Формирует текстовый отчёт по логу за последние N часов."""
+    entries = read_log_since(hours)
+    if not entries:
+        return f"📭 За последние {int(hours)}ч лог пуст (или парсинг не запускался)."
+
+    city_entries = [e for e in entries if e.get("event") == "city_done"]
+    start_entries = [e for e in entries if e.get("event") == "start"]
+    finish_entries = [e for e in entries if e.get("event") == "finish"]
+
+    total_added = sum(e.get("added", 0) for e in city_entries)
+    cities_processed = len(city_entries)
+
+    lines = [f"📊 Лог за последние {int(hours)}ч:"]
+    lines.append(f"Запусков парсинга: {len(start_entries)}")
+    lines.append(f"Городов обработано: {cities_processed}")
+    lines.append(f"Новых записей добавлено: {total_added}")
+
+    if finish_entries:
+        last_finish = finish_entries[-1]
+        lines.append(f"Последний финиш: {last_finish.get('ts', '?')} | итого {last_finish.get('total', '?')} записей")
+
+    if city_entries:
+        lines.append("\nПоследние города:")
+        for e in city_entries[-10:]:
+            lines.append(f"  {e.get('ts','?')} {e.get('city','?')}: +{e.get('added',0)} (найдено {e.get('found',0)})")
+
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["log2h"])
+def cmd_log2h(message):
+    if not _allowed(message):
+        return
+    bot.reply_to(message, _format_log_report(2))
+
+
+@bot.message_handler(commands=["log5h"])
+def cmd_log5h(message):
+    if not _allowed(message):
+        return
+    bot.reply_to(message, _format_log_report(5))
+
+
+@bot.message_handler(commands=["log10h"])
+def cmd_log10h(message):
+    if not _allowed(message):
+        return
+    bot.reply_to(message, _format_log_report(10))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@
 import re
 import time
 import csv
+import json
+import datetime
 import urllib.parse
 from pathlib import Path
 from typing import Callable
@@ -16,6 +18,38 @@ import threading
 import requests
 from bs4 import BeautifulSoup
 
+# ── Файл лога с временными метками ────────────────────────────────────────
+_LOG_FILE = Path(__file__).resolve().parent / "parse_log.jsonl"
+_log_lock = threading.Lock()
+
+
+def _write_log_entry(entry: dict) -> None:
+    entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with _log_lock:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_log_since(hours: float) -> list[dict]:
+    """Возвращает все записи лога за последние N часов."""
+    if not _LOG_FILE.exists():
+        return []
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=hours)
+    result = []
+    with open(_LOG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                ts = datetime.datetime.fromisoformat(entry.get("ts", ""))
+                if ts >= cutoff:
+                    result.append(entry)
+            except Exception:
+                pass
+    return result
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -23,10 +57,11 @@ HEADERS = {
 }
 
 # Казахстан: 2gis.kz — город -> slug в URL (все доступные на 2gis.kz)
+# Порядок: крупные города первыми (Астана, Алматы, Шымкент), затем остальные
 BASE_2GIS_KZ = "https://2gis.kz"
 CITIES_KZ = {
-    "Алматы": "almaty",
     "Астана": "astana",
+    "Алматы": "almaty",
     "Шымкент": "shymkent",
     "Караганда": "karaganda",
     "Актобе": "aktobe",
@@ -68,6 +103,31 @@ CITIES_KZ = {
     "Аксай": "aksay",
     "Форт-Шевченко": "fort_shevchenko",
 }
+
+# Стоп-слова: если название содержит одно из них — запись отфильтровывается
+FLOWER_STOPWORDS = [
+    "комнатные растения", "горшечные", "горшок", "питомник", "семена", "рассада",
+    "огород", "дача", "садовый центр", "садовые растения", "ландшафт", "газон",
+    "удобрения", "агро", "зоомагазин", "зоотовары", "ветеринар", "аптека",
+    "продукты", "супермаркет", "гипермаркет", "магазин продуктов", "хозяйственный",
+    "строительный", "мебель", "текстиль", "одежда", "обувь", "ювелир",
+    "автозапчасти", "шиномонтаж", "автосервис", "кафе", "ресторан", "столовая",
+    "пиццерия", "суши", "банк", "страхование", "нотариус", "юридические",
+    "бухгалтер", "стоматолог", "клиника", "больница", "медицин", "школа",
+    "детский сад", "университет", "колледж", "гостиница", "отель", "хостел",
+    "парикмахер", "салон красоты", "маникюр", "спортзал", "фитнес",
+    "химчистка", "прачечная", "ремонт телефон", "ремонт обуви", "ателье",
+    "похоронное", "ритуальные услуги", "памятники",
+]
+
+
+def is_flower_shop(name: str) -> bool:
+    name_lower = name.lower()
+    for stop in FLOWER_STOPWORDS:
+        if stop in name_lower:
+            return False
+    return True
+
 
 # Все поисковые запросы для цветочных — максимальный охват 10000+ по КЗ
 FLOWER_QUERIES_KZ = [
@@ -394,11 +454,13 @@ def run_parsing(
     stop_event: object | None = None,
     base_url: str = BASE_2GIS_KZ,
     max_workers: int = 4,
+    filter_noise: bool = True,
 ) -> list[dict]:
     """
-    Запускает парсинг (мультигород, многопоточный).
-    base_url: для Казахстана BASE_2GIS_KZ.
-    max_workers: число потоков для городов и для загрузки карточек.
+    Запускает парсинг — последовательный обход городов по порядку.
+    Города обходятся один за другим (Астана → Алматы → Шымкент → ...).
+    Каждый город логируется в parse_log.jsonl с временной меткой.
+    filter_noise: фильтровать нецелевые организации по стоп-словам.
     """
     def log(msg: str) -> None:
         if progress_callback:
@@ -409,59 +471,60 @@ def run_parsing(
 
     workers = max(1, min(16, max_workers))
     seen_ids: set[str] = set()
-    lock = threading.Lock()
     all_rows: list[dict] = []
 
-    # Фаза 1: сбор с поиска по городам (параллельно)
-    log(f"Сбор по {len(cities)} городам в {workers} потоков…")
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(
-                _scrape_one_city,
-                city_name,
-                city_slug,
-                search_queries,
-                max_pages_per_city,
-                delay,
-                base_url,
-                stop_event,
-            ): (city_name, city_slug)
-            for city_name, city_slug in cities
-        }
-        for fut in as_completed(futures):
-            if stopped():
-                break
-            city_name, city_slug = futures[fut]
-            try:
-                items = fut.result()
-                with lock:
-                    for item in items:
-                        if item["id_2gis"] not in seen_ids:
-                            seen_ids.add(item["id_2gis"])
-                            all_rows.append(item)
-                log(f"  {city_name}: +{len(items)}, всего {len(all_rows)}")
-            except Exception as e:
-                log(f"  {city_name}: ошибка {e}")
+    _write_log_entry({"event": "start", "cities": len(cities), "queries": len(search_queries)})
+    log(f"Сбор по {len(cities)} городам (последовательно, по порядку)…")
+
+    for city_idx, (city_name, city_slug) in enumerate(cities, 1):
+        if stopped():
+            break
+        log(f"[{city_idx}/{len(cities)}] {city_name}…")
+        items = _scrape_one_city(city_name, city_slug, search_queries, max_pages_per_city, delay, base_url, stop_event)
+
+        new_items = []
+        for item in items:
+            if item["id_2gis"] in seen_ids:
+                continue
+            if filter_noise and not is_flower_shop(item["name"]):
+                continue
+            seen_ids.add(item["id_2gis"])
+            all_rows.append(item)
+            new_items.append(item)
+
+        log(f"  {city_name}: найдено {len(items)}, добавлено {len(new_items)}, всего {len(all_rows)}")
+        _write_log_entry({
+            "event": "city_done",
+            "city": city_name,
+            "found": len(items),
+            "added": len(new_items),
+            "total": len(all_rows),
+        })
 
     if stopped():
         log("Остановлено пользователем.")
     if not all_rows:
+        _write_log_entry({"event": "finish", "total": 0})
         return all_rows
 
-    # Фаза 2: загрузка карточек (координаты + соцсети) — пул потоков
     if fetch_coordinates:
         log(f"Загрузка карточек ({len(all_rows)} шт.) в {workers} потоков…")
         city_slug_by_city = {c[0]: c[1] for c in cities}
         with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures_map = {}
             for item in all_rows:
                 if stopped():
                     break
                 slug = city_slug_by_city.get(item["city"], cities[0][1] if cities else "")
-                ex.submit(_fetch_firm_data, item, slug, base_url, delay)
+                futures_map[ex.submit(_fetch_firm_data, item, slug, base_url, delay)] = item
+            for fut in as_completed(futures_map):
+                pass
         log("    Карточки загружены.")
 
     for r in all_rows:
         r["coordinates"] = f"{r['lat']},{r['lon']}" if r.get("lat") and r.get("lon") else ""
+
+    _write_log_entry({"event": "finish", "total": len(all_rows)})
     return all_rows
 
 
