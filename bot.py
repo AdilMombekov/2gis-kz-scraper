@@ -40,8 +40,10 @@ except ImportError:
 
 from parser_2gis import (
     BASE_2GIS_KZ, CITIES_KZ, FLOWER_QUERIES_KZ,
-    get_search_page, parse_search_results, _fetch_firm_data,
-    read_log_since,
+    get_search_page, parse_search_results,
+    search_via_api, parse_api_results,
+    _fetch_firm_data, read_log_since,
+    is_flower_shop,
 )
 from google_sheets import (
     _get_service, get_spreadsheet_id,
@@ -159,22 +161,44 @@ def _run_scraper(chat_id: int):
 
         def scrape_city(city_name, city_slug):
             results = []
+            seen_local = set()
             for query in FLOWER_QUERIES_KZ:
                 if stopped():
                     break
                 for page in range(1, MAX_PAGES + 1):
                     if stopped():
                         break
-                    html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
+
+                    # Пробуем API
+                    api_data = search_via_api(city_slug, query, page)
                     time.sleep(DELAY)
-                    if not html:
-                        continue
-                    chunk = parse_search_results(html, city_name, city_slug)
-                    for item in chunk:
-                        item.setdefault("phone", "")
-                        results.append(item)
-                    if not chunk:
-                        break
+
+                    if api_data is not None:
+                        chunk = parse_api_results(api_data, city_name)
+                        if not chunk:
+                            break
+                        total = api_data.get("result", {}).get("total", 0)
+                        for item in chunk:
+                            if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
+                                seen_local.add(item["id_2gis"])
+                                item.setdefault("phone", item.get("phone", ""))
+                                results.append(item)
+                        if total and page * 20 >= total:
+                            break
+                    else:
+                        # Fallback: HTML
+                        html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
+                        time.sleep(DELAY)
+                        if not html:
+                            break
+                        chunk = parse_search_results(html, city_name, city_slug)
+                        if not chunk:
+                            break
+                        for item in chunk:
+                            if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
+                                seen_local.add(item["id_2gis"])
+                                item.setdefault("phone", "")
+                                results.append(item)
             return results
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:

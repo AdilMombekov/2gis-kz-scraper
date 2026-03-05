@@ -212,7 +212,119 @@ CITIES = {
 }
 
 
+# ── 2GIS Catalog API (внутренний, используется самим сайтом) ──────────────
+_API_BASE = "https://catalog.api.2gis.com/3.0/items"
+_API_KEY = "demos"  # публичный демо-ключ 2GIS
+
+# Словарь: slug города -> region_id для API (получается из первого запроса)
+_REGION_ID_CACHE: dict[str, str] = {}
+
+
+def _get_region_id(city_slug: str, timeout: int = 15) -> str | None:
+    """Получает region_id города по slug через API регионов 2GIS."""
+    if city_slug in _REGION_ID_CACHE:
+        return _REGION_ID_CACHE[city_slug]
+    try:
+        r = requests.get(
+            "https://catalog.api.2gis.com/2.0/region/list",
+            params={"key": _API_KEY, "q": city_slug, "locale": "ru_KZ"},
+            headers=HEADERS, timeout=timeout,
+        )
+        data = r.json()
+        items = data.get("result", {}).get("items", [])
+        if items:
+            rid = str(items[0].get("id", ""))
+            _REGION_ID_CACHE[city_slug] = rid
+            return rid
+    except Exception:
+        pass
+    return None
+
+
+def search_via_api(city_slug: str, query: str, page: int, timeout: int = 20, max_retries: int = 3) -> list[dict] | None:
+    """
+    Поиск через 2GIS Catalog API.
+    Возвращает список организаций или None при ошибке.
+    """
+    region_id = _get_region_id(city_slug, timeout)
+    params = {
+        "key": _API_KEY,
+        "q": query,
+        "type": "branch",
+        "locale": "ru_KZ",
+        "fields": "items.point,items.address,items.contact_groups,items.rubrics",
+        "page": page,
+        "page_size": 20,
+    }
+    if region_id:
+        params["region_id"] = region_id
+
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(_API_BASE, params=params, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(2 + attempt * 2)
+    return None
+
+
+def parse_api_results(data: dict, city_name: str) -> list[dict]:
+    """Разбирает ответ 2GIS Catalog API в список словарей."""
+    items = []
+    result = data.get("result", {})
+    if not result:
+        return items
+    for obj in result.get("items", []):
+        firm_id = str(obj.get("id", "")).split("_")[0]
+        if not firm_id:
+            continue
+        name = (obj.get("name") or obj.get("full_name") or "").strip()
+        if not name:
+            continue
+
+        address = ""
+        addr_obj = obj.get("address_name") or obj.get("address") or ""
+        if isinstance(addr_obj, str):
+            address = addr_obj
+        elif isinstance(addr_obj, dict):
+            address = addr_obj.get("name", "") or addr_obj.get("full_name", "")
+
+        lat, lon = "", ""
+        point = obj.get("point") or {}
+        if point:
+            lat = str(point.get("lat", ""))
+            lon = str(point.get("lon", ""))
+
+        phone = ""
+        for cg in obj.get("contact_groups") or []:
+            for c in cg.get("contacts") or []:
+                if c.get("type") == "phone":
+                    phone = c.get("value", "").replace(" ", "").replace("-", "")
+                    break
+            if phone:
+                break
+
+        items.append({
+            "id_2gis": firm_id,
+            "name": name[:200],
+            "address": address[:300],
+            "city": city_name,
+            "lat": lat,
+            "lon": lon,
+            "phone": phone,
+            "instagram": "",
+            "facebook": "",
+            "telegram": "",
+        })
+
+    seen = set()
+    return [x for x in items if x["id_2gis"] not in seen and not seen.add(x["id_2gis"])]
+
+
 def get_search_page(city_slug: str, query: str, page: int, base_url: str = BASE_2GIS_KZ, timeout: int = 20, max_retries: int = 3) -> str | None:
+    """Оставлен для совместимости. Возвращает HTML страницы поиска."""
     base = base_url.rstrip("/")
     url = f"{base}/{city_slug}/search/{urllib.parse.quote(query)}"
     if page > 1:
@@ -245,49 +357,37 @@ def get_firm_page(city_slug: str, firm_id: str, base_url: str = BASE_2GIS_KZ, ti
 
 
 def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict]:
+    """HTML парсинг — fallback если API недоступен."""
     soup = BeautifulSoup(html, "html.parser")
     items = []
-    for a in soup.find_all("a", href=re.compile(r"/" + re.escape(city_slug) + r"/firm/(\d+)")):
-        href = a.get("href", "")
-        match = re.search(r"/firm/(\d+)", href)
-        if not match:
+
+    # Пробуем вытащить данные из JSON в <script> тегах (Next.js / SSR)
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if "firm" not in text and "branch" not in text:
             continue
-        firm_id = match.group(1)
-        name = (a.get_text(strip=True) or "").strip()
-        if len(name) > 200:
-            name = name[:200]
-        if not name:
-            name = f"Организация {firm_id}"
+        for m in re.finditer(r'"id"\s*:\s*"(\d{15,})"[^}]*?"name"\s*:\s*"([^"]+)"', text):
+            firm_id, name = m.group(1), m.group(2)
+            items.append({
+                "id_2gis": firm_id, "name": name[:200], "address": "",
+                "city": city_name, "lat": "", "lon": "", "phone": "",
+                "instagram": "", "facebook": "", "telegram": "",
+            })
 
-        address = ""
-        parent = a.find_parent(["div", "article", "li", "section"])
-        if parent:
-            for elem in parent.find_all(string=True):
-                t = (elem.strip() if isinstance(elem, str) else "")
-                if t and re.search(r"(проспект|улица|набережная|шоссе|переулок|бульвар|пр\.|ул\.|,\s*[А-Яа-яёЁ\s\-]+)$", t):
-                    if "филиал" not in t.lower() and "оценок" not in t and "рейтинг" not in t.lower():
-                        address = t.split("​")[-1].strip() if "​" in t else t
-                        break
-            if not address:
-                for p in parent.find_all("p") or parent.find_all("span"):
-                    t = p.get_text(strip=True)
-                    if city_name in t and "," in t and 10 < len(t) < 200:
-                        address = t
-                        break
-
-        address_clean = (address or "").replace(" — 2ГИС", "").strip()
-        items.append({
-            "id_2gis": firm_id,
-            "name": name,
-            "address": address_clean,
-            "city": city_name,
-            "lat": "",
-            "lon": "",
-            "phone": "",
-            "instagram": "",
-            "facebook": "",
-            "telegram": "",
-        })
+    # Старый метод — ссылки <a href="/city/firm/id">
+    if not items:
+        for a in soup.find_all("a", href=re.compile(r"/" + re.escape(city_slug) + r"/firm/(\d+)")):
+            href = a.get("href", "")
+            match = re.search(r"/firm/(\d+)", href)
+            if not match:
+                continue
+            firm_id = match.group(1)
+            name = (a.get_text(strip=True) or f"Организация {firm_id}")[:200]
+            items.append({
+                "id_2gis": firm_id, "name": name, "address": "",
+                "city": city_name, "lat": "", "lon": "", "phone": "",
+                "instagram": "", "facebook": "", "telegram": "",
+            })
 
     seen = set()
     return [x for x in items if x["id_2gis"] not in seen and not seen.add(x["id_2gis"])]
@@ -402,26 +502,51 @@ def _scrape_one_city(
     base_url: str,
     stop_event: object | None,
 ) -> list[dict]:
-    """Собирает результаты по одному городу (для многопоточного запуска)."""
+    """Собирает результаты по одному городу через API (с fallback на HTML)."""
     def stopped() -> bool:
         return stop_event is not None and getattr(stop_event, "is_set", lambda: False)()
 
     results = []
+    seen_local: set[str] = set()
+
     for query in search_queries:
         if stopped():
             break
         for page in range(1, max_pages_per_city + 1):
             if stopped():
                 break
-            html = get_search_page(city_slug, query, page, base_url=base_url)
+
+            # Сначала пробуем API
+            api_data = search_via_api(city_slug, query, page)
             time.sleep(delay)
-            if not html:
-                continue
-            chunk = parse_search_results(html, city_name, city_slug)
-            for item in chunk:
-                results.append(item)
-            if not chunk:
-                break
+
+            if api_data is not None:
+                chunk = parse_api_results(api_data, city_name)
+                # Если API вернул пустой результат — страниц больше нет
+                if not chunk:
+                    break
+                # Проверяем total_count чтобы не листать лишние страницы
+                total = api_data.get("result", {}).get("total", 0)
+                for item in chunk:
+                    if item["id_2gis"] not in seen_local:
+                        seen_local.add(item["id_2gis"])
+                        results.append(item)
+                if total and page * 20 >= total:
+                    break
+            else:
+                # Fallback: HTML парсинг
+                html = get_search_page(city_slug, query, page, base_url=base_url)
+                time.sleep(delay)
+                if not html:
+                    break
+                chunk = parse_search_results(html, city_name, city_slug)
+                if not chunk:
+                    break
+                for item in chunk:
+                    if item["id_2gis"] not in seen_local:
+                        seen_local.add(item["id_2gis"])
+                        results.append(item)
+
     return results
 
 
