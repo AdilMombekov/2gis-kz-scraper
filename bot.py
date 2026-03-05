@@ -502,93 +502,32 @@ def cmd_log10h(message):
 def cmd_test(message):
     if not _allowed(message):
         return
-    bot.reply_to(message, "🔍 Тестирую API и HTML парсинг для Алматы / цветы...")
+    bot.reply_to(message, "🔍 Тестирую HTML парсинг для Алматы / цветы...")
 
     import requests as _req
+    from parser_2gis import HEADERS, parse_search_results
     results = []
 
-    # Тест 1: Catalog API
     try:
         r = _req.get(
-            "https://catalog.api.2gis.com/3.0/items",
-            params={"key": "demos", "q": "цветы", "type": "branch",
-                    "locale": "ru_KZ", "page": 1, "page_size": 5},
-            timeout=15,
+            "https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
+            headers=HEADERS, timeout=20, allow_redirects=True,
         )
-        data = r.json()
-        total = data.get("result", {}).get("total", "?")
-        items = data.get("result", {}).get("items", [])
-        results.append(f"✅ Catalog API (без region_id):\nstatus={r.status_code}, total={total}, items={len(items)}")
-        if items:
-            results.append(f"  Первый: {items[0].get('name','?')} | id={items[0].get('id','?')}")
-        else:
-            results.append(f"  Ответ: {str(data)[:300]}")
+        html = r.text
+        firm_count = html.count("/firm/")
+        parsed = parse_search_results(html, "Алматы", "almaty")
+        results.append(f"status={r.status_code} /firm/={firm_count} size={len(html)}")
+        results.append(f"Парсер нашёл: {len(parsed)} организаций")
+        for p in parsed[:5]:
+            results.append(f"  → {p['name'][:60]} | {p['id_2gis']}")
+        if not parsed and firm_count > 0:
+            m = re.search(r'/almaty/firm/(\d{10,})', html)
+            if m:
+                pos = m.start()
+                chunk = re.sub(r'\s+', ' ', html[max(0, pos - 50):pos + 400])
+                results.append(f"Контекст:\n{chunk[:500]}")
     except Exception as e:
-        results.append(f"❌ Catalog API ошибка: {e}")
-
-    # Тест 2: API с region_id Алматы
-    try:
-        r2 = _req.get(
-            "https://catalog.api.2gis.com/2.0/region/list",
-            params={"key": "demos", "q": "almaty", "locale": "ru_KZ"},
-            timeout=15,
-        )
-        rdata = r2.json()
-        reg_items = rdata.get("result", {}).get("items", [])
-        if reg_items:
-            rid = reg_items[0].get("id")
-            results.append(f"✅ Region API: almaty region_id={rid}")
-            r3 = _req.get(
-                "https://catalog.api.2gis.com/3.0/items",
-                params={"key": "demos", "q": "цветы", "type": "branch",
-                        "locale": "ru_KZ", "region_id": rid, "page": 1, "page_size": 5},
-                timeout=15,
-            )
-            d3 = r3.json()
-            total3 = d3.get("result", {}).get("total", "?")
-            items3 = d3.get("result", {}).get("items", [])
-            results.append(f"  С region_id: total={total3}, items={len(items3)}")
-            if items3:
-                results.append(f"  Первый: {items3[0].get('name','?')}")
-            else:
-                results.append(f"  Ответ: {str(d3)[:300]}")
-        else:
-            results.append(f"❌ Region API пустой: {str(rdata)[:200]}")
-    except Exception as e:
-        results.append(f"❌ Region API ошибка: {e}")
-
-    # Тест 3: HTML страница — несколько User-Agent
-    ua_list = [
-        ("Chrome Win", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
-        ("Chrome Android", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"),
-        ("curl", "curl/7.88.1"),
-    ]
-    for ua_name, ua in ua_list:
-        try:
-            hdrs = {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-            }
-            r4 = _req.get("https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
-                          headers=hdrs, timeout=15, allow_redirects=True)
-            html = r4.text
-            firm_count = html.count("/firm/")
-            # Первые 300 символов HTML
-            preview = re.sub(r'\s+', ' ', html[:300])
-            results.append(f"[{ua_name}] status={r4.status_code} /firm/={firm_count} size={len(html)}\n  preview: {preview}")
-            if firm_count > 0:
-                # Показываем контекст вокруг первого ID
-                m4 = re.search(r'/almaty/firm/(\d{10,})', html)
-                if m4:
-                    pos = m4.start()
-                    chunk = re.sub(r'\s+', ' ', html[max(0, pos-80):pos+300])
-                    results.append(f"  context: {chunk[:400]}")
-                break
-        except Exception as e:
-            results.append(f"[{ua_name}] ❌ {e}")
+        results.append(f"❌ Ошибка: {e}")
 
     bot.send_message(message.chat.id, "\n".join(results))
 

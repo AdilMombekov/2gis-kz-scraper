@@ -359,38 +359,44 @@ def get_firm_page(city_slug: str, firm_id: str, base_url: str = BASE_2GIS_KZ, ti
 def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict]:
     """
     Парсит HTML страницы поиска 2GIS.
-    2GIS — SPA, данные зашиты в JS-бандл как строки вида /city/firm/ID.
-    Ищем все firm ID в сыром тексте, затем пытаемся найти имена рядом.
+    Структура: <a href="/city/firm/ID" class="..."><span class="..."><span>Название</span>
+    Ищем по этому паттерну в сыром HTML.
     """
     items = []
     seen: set[str] = set()
 
-    # Метод 1: ищем все /city_slug/firm/ID в сыром HTML (JS-бандл, JSON, href)
-    for m in re.finditer(r'/' + re.escape(city_slug) + r'/firm/(\d{10,})', html):
+    # Основной паттерн: href="/city/firm/ID"...>...<span>Название</span>
+    # Берём кусок до 600 символов после href чтобы найти первый <span>текст</span>
+    for m in re.finditer(
+        r'href="/' + re.escape(city_slug) + r'/firm/(\d{10,})"[^>]*>(.{0,600})',
+        html, re.DOTALL
+    ):
         firm_id = m.group(1)
         if firm_id in seen:
             continue
         seen.add(firm_id)
 
-        # Пытаемся найти название рядом с этим ID в радиусе 300 символов
-        pos = m.start()
-        chunk = html[max(0, pos - 50): pos + 350]
-
+        chunk = m.group(2)
         name = ""
-        # Ищем "name":"Название" рядом
-        nm = re.search(r'"name"\s*:\s*"([^"]{2,100})"', chunk)
-        if nm:
-            name = nm.group(1)
-        # Или "title":"Название"
-        if not name:
-            tm = re.search(r'"title"\s*:\s*"([^"]{2,100})"', chunk)
-            if tm:
-                name = tm.group(1)
 
-        # Убираем служебные строки
-        if name and any(x in name for x in ("\\u", "function", "return", "=>", "module")):
-            name = ""
+        # Ищем первый <span>Текст</span> без вложенных тегов
+        spm = re.search(r'<span[^>]*>\s*<span[^>]*>([^<]{2,150})</span>', chunk)
+        if spm:
+            name = spm.group(1).strip()
+
+        # Или просто первый <span>Текст</span>
         if not name:
+            spm2 = re.search(r'<span[^>]*>([^<]{2,150})</span>', chunk)
+            if spm2:
+                name = spm2.group(1).strip()
+
+        # Или aria-label на самой ссылке
+        if not name:
+            am = re.search(r'aria-label="([^"]{2,150})"', m.group(0))
+            if am:
+                name = am.group(1).strip()
+
+        if not name or any(x in name for x in ("<", ">", "function", "return", "=>")):
             name = f"Организация {firm_id}"
 
         items.append({
@@ -401,21 +407,6 @@ def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict
             "lat": "", "lon": "", "phone": "",
             "instagram": "", "facebook": "", "telegram": "",
         })
-
-    # Метод 2: JSON блоки в <script> — ищем объекты с id + name
-    if not items:
-        for m in re.finditer(
-            r'\{"id"\s*:\s*"(\d{10,})"[^{}]{0,500}?"name"\s*:\s*"([^"]{2,150})"',
-            html, re.DOTALL
-        ):
-            firm_id, name = m.group(1), m.group(2)
-            if firm_id not in seen:
-                seen.add(firm_id)
-                items.append({
-                    "id_2gis": firm_id, "name": name[:200], "address": "",
-                    "city": city_name, "lat": "", "lon": "", "phone": "",
-                    "instagram": "", "facebook": "", "telegram": "",
-                })
 
     return items
 
