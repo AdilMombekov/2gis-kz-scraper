@@ -31,6 +31,8 @@ _RETRYABLE_ERRORS = (
     OSError,
 )
 _MAX_RETRIES = 7
+_MAX_CELL_CHARS = 50000
+_TRUNCATION_SUFFIX = "... [TRUNCATED]"
 
 
 def _retry(fn, *args, **kwargs):
@@ -138,6 +140,36 @@ def _normalize_id(raw_id: str) -> str:
     return str(raw_id).lstrip("'").replace("\xa0", "").replace(" ", "").replace(",", "").replace(".", "").strip()
 
 
+def _sanitize_cell_value(value: object) -> tuple[str, bool]:
+    """
+    Приводит значение ячейки к строке и гарантирует лимит Google Sheets (50000 символов).
+    Возвращает (sanitized_value, was_truncated).
+    """
+    s = str(value or "")
+    if len(s) <= _MAX_CELL_CHARS:
+        return s, False
+
+    keep = max(0, _MAX_CELL_CHARS - len(_TRUNCATION_SUFFIX))
+    return s[:keep] + _TRUNCATION_SUFFIX, True
+
+
+def _build_row_values(data: Dict) -> tuple[List[str], int]:
+    """Готовит строку значений в порядке COLUMNS и считает число усечённых ячеек."""
+    row_vals: List[str] = []
+    truncated_cells = 0
+    for col in COLUMNS:
+        val = data.get(col, "")
+        if col == "id_2gis":
+            raw = str(val or "")
+            if raw.isdigit():
+                val = "'" + raw
+        safe, was_truncated = _sanitize_cell_value(val)
+        if was_truncated:
+            truncated_cells += 1
+        row_vals.append(safe)
+    return row_vals, truncated_cells
+
+
 def get_existing_rows(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -> list:
     """
     Читает все строки из таблицы (начиная со строки 2).
@@ -177,12 +209,12 @@ def get_existing_ids(service, spreadsheet_id: str, sheet_name: str = "Sheet1") -
 
 def update_row(service, spreadsheet_id: str, row_index: int, data: dict, sheet_name: str = "Sheet1") -> None:
     """Обновляет одну строку в таблице по номеру строки (1-based)."""
-    row_vals = []
-    for col in COLUMNS:
-        val = str(data.get(col, "") or "")
-        if col == "id_2gis" and val.isdigit():
-            val = "'" + val
-        row_vals.append(val)
+    row_vals, truncated_cells = _build_row_values(data)
+    if truncated_cells:
+        print(
+            f"⚠️ Строка {row_index}: усечено ячеек из-за лимита Google Sheets (50000): {truncated_cells}",
+            flush=True,
+        )
     range_ = _sheet_range(sheet_name, f"A{row_index}:K{row_index}")
     _retry(service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
@@ -200,14 +232,17 @@ def append_rows(service, spreadsheet_id: str, rows: List[Dict], sheet_name: str 
     if not rows:
         return 0
     values = []
+    total_truncated_cells = 0
     for r in rows:
-        row_vals = []
-        for col in COLUMNS:
-            val = str(r.get(col, "") or "")
-            if col == "id_2gis" and val.isdigit():
-                val = "'" + val
-            row_vals.append(val)
+        row_vals, truncated_cells = _build_row_values(r)
+        total_truncated_cells += truncated_cells
         values.append(row_vals)
+
+    if total_truncated_cells:
+        print(
+            f"⚠️ append_rows: усечено ячеек из-за лимита Google Sheets (50000): {total_truncated_cells}",
+            flush=True,
+        )
 
     _retry(service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
