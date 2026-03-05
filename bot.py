@@ -556,19 +556,24 @@ def cmd_test(message):
     except Exception as e:
         results.append(f"❌ Region API ошибка: {e}")
 
-    # Тест 3: HTML страница + новый парсер
+    # Тест 3: HTML страница + сырой контекст вокруг первого firm ID
     try:
         from parser_2gis import HEADERS, parse_search_results
         r4 = _req.get("https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
                       headers=HEADERS, timeout=15)
         html = r4.text
         firm_count = html.count("/firm/")
-        script_count = html.count("<script")
         parsed = parse_search_results(html, "Алматы", "almaty")
-        results.append(f"✅ HTML 2gis.kz: status={r4.status_code}, /firm/={firm_count}, <script>={script_count}, размер={len(html)}")
-        results.append(f"  Парсер нашёл: {len(parsed)} организаций")
-        for p in parsed[:3]:
-            results.append(f"  → {p['id_2gis']} | {p['name'][:50]}")
+        results.append(f"✅ HTML: /firm/={firm_count}, парсер нашёл={len(parsed)}")
+
+        # Показываем сырой кусок HTML вокруг первого firm ID
+        m = re.search(r'/almaty/firm/(\d{10,})', html)
+        if m:
+            pos = m.start()
+            chunk = html[max(0, pos-100):pos+400]
+            # Убираем лишние пробелы для читаемости
+            chunk_clean = re.sub(r'\s+', ' ', chunk)
+            results.append(f"Контекст вокруг ID:\n{chunk_clean[:600]}")
     except Exception as e:
         results.append(f"❌ HTML ошибка: {e}")
 
