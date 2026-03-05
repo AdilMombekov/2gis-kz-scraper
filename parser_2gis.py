@@ -357,40 +357,67 @@ def get_firm_page(city_slug: str, firm_id: str, base_url: str = BASE_2GIS_KZ, ti
 
 
 def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict]:
-    """HTML парсинг — fallback если API недоступен."""
-    soup = BeautifulSoup(html, "html.parser")
+    """
+    Парсит HTML страницы поиска 2GIS.
+    2GIS — SPA, данные зашиты в JS-бандл как строки вида /city/firm/ID.
+    Ищем все firm ID в сыром тексте, затем пытаемся найти имена рядом.
+    """
     items = []
+    seen: set[str] = set()
 
-    # Пробуем вытащить данные из JSON в <script> тегах (Next.js / SSR)
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        if "firm" not in text and "branch" not in text:
+    # Метод 1: ищем все /city_slug/firm/ID в сыром HTML (JS-бандл, JSON, href)
+    for m in re.finditer(r'/' + re.escape(city_slug) + r'/firm/(\d{10,})', html):
+        firm_id = m.group(1)
+        if firm_id in seen:
             continue
-        for m in re.finditer(r'"id"\s*:\s*"(\d{15,})"[^}]*?"name"\s*:\s*"([^"]+)"', text):
-            firm_id, name = m.group(1), m.group(2)
-            items.append({
-                "id_2gis": firm_id, "name": name[:200], "address": "",
-                "city": city_name, "lat": "", "lon": "", "phone": "",
-                "instagram": "", "facebook": "", "telegram": "",
-            })
+        seen.add(firm_id)
 
-    # Старый метод — ссылки <a href="/city/firm/id">
+        # Пытаемся найти название рядом с этим ID в радиусе 300 символов
+        pos = m.start()
+        chunk = html[max(0, pos - 50): pos + 350]
+
+        name = ""
+        # Ищем "name":"Название" рядом
+        nm = re.search(r'"name"\s*:\s*"([^"]{2,100})"', chunk)
+        if nm:
+            name = nm.group(1)
+        # Или "title":"Название"
+        if not name:
+            tm = re.search(r'"title"\s*:\s*"([^"]{2,100})"', chunk)
+            if tm:
+                name = tm.group(1)
+
+        # Убираем служебные строки
+        if name and any(x in name for x in ("\\u", "function", "return", "=>", "module")):
+            name = ""
+        if not name:
+            name = f"Организация {firm_id}"
+
+        items.append({
+            "id_2gis": firm_id,
+            "name": name[:200],
+            "address": "",
+            "city": city_name,
+            "lat": "", "lon": "", "phone": "",
+            "instagram": "", "facebook": "", "telegram": "",
+        })
+
+    # Метод 2: JSON блоки в <script> — ищем объекты с id + name
     if not items:
-        for a in soup.find_all("a", href=re.compile(r"/" + re.escape(city_slug) + r"/firm/(\d+)")):
-            href = a.get("href", "")
-            match = re.search(r"/firm/(\d+)", href)
-            if not match:
-                continue
-            firm_id = match.group(1)
-            name = (a.get_text(strip=True) or f"Организация {firm_id}")[:200]
-            items.append({
-                "id_2gis": firm_id, "name": name, "address": "",
-                "city": city_name, "lat": "", "lon": "", "phone": "",
-                "instagram": "", "facebook": "", "telegram": "",
-            })
+        for m in re.finditer(
+            r'\{"id"\s*:\s*"(\d{10,})"[^{}]{0,500}?"name"\s*:\s*"([^"]{2,150})"',
+            html, re.DOTALL
+        ):
+            firm_id, name = m.group(1), m.group(2)
+            if firm_id not in seen:
+                seen.add(firm_id)
+                items.append({
+                    "id_2gis": firm_id, "name": name[:200], "address": "",
+                    "city": city_name, "lat": "", "lon": "", "phone": "",
+                    "instagram": "", "facebook": "", "telegram": "",
+                })
 
-    seen = set()
-    return [x for x in items if x["id_2gis"] not in seen and not seen.add(x["id_2gis"])]
+    return items
 
 
 def _extract_social_links(html: str) -> dict[str, str]:
@@ -515,37 +542,17 @@ def _scrape_one_city(
         for page in range(1, max_pages_per_city + 1):
             if stopped():
                 break
-
-            # Сначала пробуем API
-            api_data = search_via_api(city_slug, query, page)
+            html = get_search_page(city_slug, query, page, base_url=base_url)
             time.sleep(delay)
-
-            if api_data is not None:
-                chunk = parse_api_results(api_data, city_name)
-                # Если API вернул пустой результат — страниц больше нет
-                if not chunk:
-                    break
-                # Проверяем total_count чтобы не листать лишние страницы
-                total = api_data.get("result", {}).get("total", 0)
-                for item in chunk:
-                    if item["id_2gis"] not in seen_local:
-                        seen_local.add(item["id_2gis"])
-                        results.append(item)
-                if total and page * 20 >= total:
-                    break
-            else:
-                # Fallback: HTML парсинг
-                html = get_search_page(city_slug, query, page, base_url=base_url)
-                time.sleep(delay)
-                if not html:
-                    break
-                chunk = parse_search_results(html, city_name, city_slug)
-                if not chunk:
-                    break
-                for item in chunk:
-                    if item["id_2gis"] not in seen_local:
-                        seen_local.add(item["id_2gis"])
-                        results.append(item)
+            if not html:
+                break
+            chunk = parse_search_results(html, city_name, city_slug)
+            if not chunk:
+                break
+            for item in chunk:
+                if item["id_2gis"] not in seen_local:
+                    seen_local.add(item["id_2gis"])
+                    results.append(item)
 
     return results
 

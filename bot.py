@@ -168,37 +168,18 @@ def _run_scraper(chat_id: int):
                 for page in range(1, MAX_PAGES + 1):
                     if stopped():
                         break
-
-                    # Пробуем API
-                    api_data = search_via_api(city_slug, query, page)
+                    html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
                     time.sleep(DELAY)
-
-                    if api_data is not None:
-                        chunk = parse_api_results(api_data, city_name)
-                        if not chunk:
-                            break
-                        total = api_data.get("result", {}).get("total", 0)
-                        for item in chunk:
-                            if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
-                                seen_local.add(item["id_2gis"])
-                                item.setdefault("phone", item.get("phone", ""))
-                                results.append(item)
-                        if total and page * 20 >= total:
-                            break
-                    else:
-                        # Fallback: HTML
-                        html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
-                        time.sleep(DELAY)
-                        if not html:
-                            break
-                        chunk = parse_search_results(html, city_name, city_slug)
-                        if not chunk:
-                            break
-                        for item in chunk:
-                            if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
-                                seen_local.add(item["id_2gis"])
-                                item.setdefault("phone", "")
-                                results.append(item)
+                    if not html:
+                        break
+                    chunk = parse_search_results(html, city_name, city_slug)
+                    if not chunk:
+                        break
+                    for item in chunk:
+                        if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
+                            seen_local.add(item["id_2gis"])
+                            item.setdefault("phone", "")
+                            results.append(item)
             return results
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -575,15 +556,19 @@ def cmd_test(message):
     except Exception as e:
         results.append(f"❌ Region API ошибка: {e}")
 
-    # Тест 3: HTML страница
+    # Тест 3: HTML страница + новый парсер
     try:
-        from parser_2gis import HEADERS
+        from parser_2gis import HEADERS, parse_search_results
         r4 = _req.get("https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
                       headers=HEADERS, timeout=15)
         html = r4.text
         firm_count = html.count("/firm/")
         script_count = html.count("<script")
-        results.append(f"✅ HTML 2gis.kz: status={r4.status_code}, /firm/ упоминаний={firm_count}, <script>={script_count}, размер={len(html)}")
+        parsed = parse_search_results(html, "Алматы", "almaty")
+        results.append(f"✅ HTML 2gis.kz: status={r4.status_code}, /firm/={firm_count}, <script>={script_count}, размер={len(html)}")
+        results.append(f"  Парсер нашёл: {len(parsed)} организаций")
+        for p in parsed[:3]:
+            results.append(f"  → {p['id_2gis']} | {p['name'][:50]}")
     except Exception as e:
         results.append(f"❌ HTML ошибка: {e}")
 
