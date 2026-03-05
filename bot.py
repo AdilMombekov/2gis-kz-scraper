@@ -26,6 +26,7 @@ Telegram-бот для управления парсером 2GIS KZ -> Google S
 """
 
 import os
+import re
 import sys
 import time
 import threading
@@ -556,26 +557,38 @@ def cmd_test(message):
     except Exception as e:
         results.append(f"❌ Region API ошибка: {e}")
 
-    # Тест 3: HTML страница + сырой контекст вокруг первого firm ID
-    try:
-        from parser_2gis import HEADERS, parse_search_results
-        r4 = _req.get("https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
-                      headers=HEADERS, timeout=15)
-        html = r4.text
-        firm_count = html.count("/firm/")
-        parsed = parse_search_results(html, "Алматы", "almaty")
-        results.append(f"✅ HTML: /firm/={firm_count}, парсер нашёл={len(parsed)}")
-
-        # Показываем сырой кусок HTML вокруг первого firm ID
-        m = re.search(r'/almaty/firm/(\d{10,})', html)
-        if m:
-            pos = m.start()
-            chunk = html[max(0, pos-100):pos+400]
-            # Убираем лишние пробелы для читаемости
-            chunk_clean = re.sub(r'\s+', ' ', chunk)
-            results.append(f"Контекст вокруг ID:\n{chunk_clean[:600]}")
-    except Exception as e:
-        results.append(f"❌ HTML ошибка: {e}")
+    # Тест 3: HTML страница — несколько User-Agent
+    ua_list = [
+        ("Chrome Win", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+        ("Chrome Android", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"),
+        ("curl", "curl/7.88.1"),
+    ]
+    for ua_name, ua in ua_list:
+        try:
+            hdrs = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+            }
+            r4 = _req.get("https://2gis.kz/almaty/search/%D1%86%D0%B2%D0%B5%D1%82%D1%8B",
+                          headers=hdrs, timeout=15, allow_redirects=True)
+            html = r4.text
+            firm_count = html.count("/firm/")
+            # Первые 300 символов HTML
+            preview = re.sub(r'\s+', ' ', html[:300])
+            results.append(f"[{ua_name}] status={r4.status_code} /firm/={firm_count} size={len(html)}\n  preview: {preview}")
+            if firm_count > 0:
+                # Показываем контекст вокруг первого ID
+                m4 = re.search(r'/almaty/firm/(\d{10,})', html)
+                if m4:
+                    pos = m4.start()
+                    chunk = re.sub(r'\s+', ' ', html[max(0, pos-80):pos+300])
+                    results.append(f"  context: {chunk[:400]}")
+                break
+        except Exception as e:
+            results.append(f"[{ua_name}] ❌ {e}")
 
     bot.send_message(message.chat.id, "\n".join(results))
 
