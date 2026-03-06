@@ -44,7 +44,7 @@ from parser_2gis import (
     get_search_page, parse_search_results,
     search_via_api, parse_api_results,
     _fetch_firm_data, read_log_since,
-    is_flower_shop,
+    is_flower_shop, _write_log_entry,
 )
 from google_sheets import (
     _get_service, get_spreadsheet_id,
@@ -128,6 +128,7 @@ def _run_scraper(chat_id: int):
         with _state_lock:
             _state["total_in_sheet"] = len(seen_ids)
         log(f"Уже в таблице: {len(seen_ids)} записей\nНачинаю парсинг {len(CITIES_KZ)} городов...")
+        _write_log_entry({"event": "start", "cities": len(CITIES_KZ), "queries": len(FLOWER_QUERIES_KZ)})
 
         city_list = list(CITIES_KZ.items())
         city_slug_by_city = dict(city_list)
@@ -169,13 +170,25 @@ def _run_scraper(chat_id: int):
                 for page in range(1, MAX_PAGES + 1):
                     if stopped():
                         break
-                    html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
+
+                    # Сначала пробуем API (надёжнее, не блокируется)
+                    api_data = search_via_api(city_slug, query, page)
                     time.sleep(DELAY)
-                    if not html:
-                        break
-                    chunk = parse_search_results(html, city_name, city_slug)
-                    if not chunk:
-                        break
+                    if api_data is not None:
+                        chunk = parse_api_results(api_data, city_name)
+                        # Если API вернул пустой результат — страниц больше нет
+                        if not chunk:
+                            break
+                    else:
+                        # Fallback на HTML если API недоступен
+                        html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
+                        time.sleep(DELAY)
+                        if not html:
+                            break
+                        chunk = parse_search_results(html, city_name, city_slug)
+                        if not chunk:
+                            break
+
                     for item in chunk:
                         if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
                             seen_local.add(item["id_2gis"])
@@ -211,6 +224,7 @@ def _run_scraper(chat_id: int):
                     _state["current_city"] = city_name
 
                 log(f"✅ {city_name}: +{len(new_items)} новых | буфер: {len(new_buffer)} | время: {_elapsed()}")
+                _write_log_entry({"event": "city_done", "city": city_name, "added": len(new_items), "found": len(items)})
 
                 if len(new_buffer) >= BATCH_SIZE:
                     batch = list(new_buffer)
@@ -226,14 +240,20 @@ def _run_scraper(chat_id: int):
             new_buffer.clear()
 
         sid = get_spreadsheet_id()
+        _write_log_entry({"event": "finish", "total": total_written, "stopped": stopped()})
         if stopped():
             log(f"🛑 Остановлено вручную.\nЗаписано новых: {total_written}\nhttps://docs.google.com/spreadsheets/d/{sid}")
         else:
             log(f"🎉 Готово! Записано новых: {total_written}\nВремя: {_elapsed()}\nhttps://docs.google.com/spreadsheets/d/{sid}")
 
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"CRITICAL ERROR in _run_scraper: {e}\n{tb}", flush=True)
         try:
-            bot.send_message(chat_id, f"❌ Критическая ошибка:\n{e}\n\n{traceback.format_exc()[:1000]}")
+            # Отправляем полный трейсбек частями по 3000 символов
+            full_msg = f"❌ Критическая ошибка:\n{e}\n\n{tb}"
+            for i in range(0, min(len(full_msg), 9000), 3000):
+                bot.send_message(chat_id, full_msg[i:i+3000])
         except Exception:
             pass
     finally:
