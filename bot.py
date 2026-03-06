@@ -170,25 +170,13 @@ def _run_scraper(chat_id: int):
                 for page in range(1, MAX_PAGES + 1):
                     if stopped():
                         break
-
-                    # Сначала пробуем API (надёжнее, не блокируется)
-                    api_data = search_via_api(city_slug, query, page)
+                    html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
                     time.sleep(DELAY)
-                    if api_data is not None:
-                        chunk = parse_api_results(api_data, city_name)
-                        # Если API вернул пустой результат — страниц больше нет
-                        if not chunk:
-                            break
-                    else:
-                        # Fallback на HTML если API недоступен
-                        html = get_search_page(city_slug, query, page, base_url=BASE_2GIS_KZ)
-                        time.sleep(DELAY)
-                        if not html:
-                            break
-                        chunk = parse_search_results(html, city_name, city_slug)
-                        if not chunk:
-                            break
-
+                    if not html:
+                        break
+                    chunk = parse_search_results(html, city_name, city_slug)
+                    if not chunk:
+                        break
                     for item in chunk:
                         if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
                             seen_local.add(item["id_2gis"])

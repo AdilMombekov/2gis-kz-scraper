@@ -359,16 +359,13 @@ def get_firm_page(city_slug: str, firm_id: str, base_url: str = BASE_2GIS_KZ, ti
 def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict]:
     """
     Парсит HTML страницы поиска 2GIS.
-    Структура: <a href="/city/firm/ID" class="..."><span class="..."><span>Название</span>
-    Ищем по этому паттерну в сыром HTML.
+    Ищет все href="/city/firm/ID" и извлекает название из ближайшего текстового контента.
     """
     items = []
     seen: set[str] = set()
 
-    # Основной паттерн: href="/city/firm/ID"...>...<span>Название</span>
-    # Берём кусок до 600 символов после href чтобы найти первый <span>текст</span>
     for m in re.finditer(
-        r'href="/' + re.escape(city_slug) + r'/firm/(\d{10,})"[^>]*>(.{0,600})',
+        r'href="/' + re.escape(city_slug) + r'/firm/(\d{10,})"([^>]*)>(.{0,800})',
         html, re.DOTALL
     ):
         firm_id = m.group(1)
@@ -376,27 +373,34 @@ def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict
             continue
         seen.add(firm_id)
 
-        chunk = m.group(2)
+        attr_str = m.group(2)
+        chunk = m.group(3)
         name = ""
 
-        # Ищем первый <span>Текст</span> без вложенных тегов
-        spm = re.search(r'<span[^>]*>\s*<span[^>]*>([^<]{2,150})</span>', chunk)
-        if spm:
-            name = spm.group(1).strip()
+        # 1. aria-label на самой ссылке — самый надёжный
+        am = re.search(r'aria-label="([^"]{2,200})"', attr_str)
+        if am:
+            name = am.group(1).strip()
 
-        # Или просто первый <span>Текст</span>
+        # 2. Вложенный span с текстом без тегов внутри
         if not name:
-            spm2 = re.search(r'<span[^>]*>([^<]{2,150})</span>', chunk)
-            if spm2:
-                name = spm2.group(1).strip()
+            for spm in re.finditer(r'<span[^>]*>([^<]{2,200})</span>', chunk):
+                candidate = spm.group(1).strip()
+                # Пропускаем технические строки
+                if candidate and not re.search(r'[{};=\(\)\\]|function|return|=>|var |const |let ', candidate):
+                    name = candidate
+                    break
 
-        # Или aria-label на самой ссылке
+        # 3. Любой текст между тегами
         if not name:
-            am = re.search(r'aria-label="([^"]{2,150})"', m.group(0))
-            if am:
-                name = am.group(1).strip()
+            texts = re.findall(r'>([А-Яа-яёЁA-Za-z][^<]{1,150})<', chunk)
+            for t in texts:
+                t = t.strip()
+                if t and not re.search(r'[{};=\(\)\\]|function|return', t):
+                    name = t
+                    break
 
-        if not name or any(x in name for x in ("<", ">", "function", "return", "=>")):
+        if not name:
             name = f"Организация {firm_id}"
 
         items.append({
@@ -414,78 +418,115 @@ def parse_search_results(html: str, city_name: str, city_slug: str) -> list[dict
 def _extract_social_links(html: str) -> dict[str, str]:
     """Извлекает ссылки на Instagram, Facebook, Telegram из HTML карточки."""
     out = {"instagram": "", "facebook": "", "telegram": ""}
-    # instagram.com/username или instagram.com/username/
-    for m in re.finditer(r"instagram\.com[/\w\.\-]+", html):
-        s = m.group(0).replace("instagram.com/", "").strip("/")
-        if s and s != "accounts" and len(s) < 80:
-            out["instagram"] = "https://www.instagram.com/" + s.split("/")[0]
+    _SKIP_INSTAGRAM = {"accounts", "p", "explore", "reel", "stories", "tv"}
+    for m in re.finditer(r'instagram\.com/([\w\.\-]{2,60})/?', html):
+        slug = m.group(1).split("/")[0].split("?")[0]
+        if slug and slug not in _SKIP_INSTAGRAM:
+            out["instagram"] = "https://www.instagram.com/" + slug
             break
-    for m in re.finditer(r"facebook\.com[/\w\.\-]+", html):
-        s = m.group(0).replace("facebook.com/", "").strip("/")
-        if s and s != "sharer" and len(s) < 80:
-            out["facebook"] = "https://www.facebook.com/" + s.split("/")[0]
+    _SKIP_FACEBOOK = {"sharer", "share", "plugins", "tr", "dialog", "photo"}
+    for m in re.finditer(r'facebook\.com/([\w\.\-]{2,80})/?', html):
+        slug = m.group(1).split("/")[0].split("?")[0]
+        if slug and slug not in _SKIP_FACEBOOK:
+            out["facebook"] = "https://www.facebook.com/" + slug
             break
-    for m in re.finditer(r"t\.me/[\w\.\-]+", html):
-        s = m.group(0).replace("t.me/", "").strip()
-        if s and len(s) < 80:
-            out["telegram"] = "https://t.me/" + s.split("?")[0]
+    for m in re.finditer(r't\.me/([\w\.\-]{3,60})', html):
+        slug = m.group(1).split("?")[0]
+        if slug:
+            out["telegram"] = "https://t.me/" + slug
             break
     if not out["telegram"]:
-        for m in re.finditer(r"telegram\.(me|dog)/[\w\.\-]+", html):
-            out["telegram"] = "https://" + m.group(0).split('"')[0].split("'")[0]
+        for m in re.finditer(r'telegram\.(me|dog)/([\w\.\-]{3,60})', html):
+            out["telegram"] = "https://t.me/" + m.group(2).split("?")[0]
             break
     return out
 
 
 def _extract_phone(html: str) -> str:
     """Извлекает номер телефона из карточки 2GIS (tel:, +7, 8...)."""
-    # tel: ссылки
-    for m in re.finditer(r'tel:[\s]*([+\d\s\-\(\)]{10,20})', html):
+    for m in re.finditer(r'tel:([\+\d][\d\s\-\(\)]{8,18})', html):
         s = re.sub(r"[\s\-\(\)]", "", m.group(1))
-        if len(s) >= 10 and s.isdigit() or s.startswith("+"):
+        if len(s) >= 10:
             return s[:20]
-    # +7 или 8 и 10 цифр
-    for m in re.finditer(r"(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}", html):
+    for m in re.finditer(r'(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}', html):
         s = re.sub(r"[\s\-\(\)]", "", m.group(0))
         if len(s) >= 10:
             return s[:20]
     return ""
 
 
-def parse_firm_page(html: str) -> tuple[str, str, str, str, dict[str, str]]:
-    """Возвращает (address, lat, lon, phone, socials_dict)."""
-    lat, lon = "", ""
-    match = re.search(r"directions/points/[^\"']*?[\|%7C](\d+\.\d+)[,%2C](\d+\.\d+)", html)
-    if match:
-        lon, lat = match.group(1), match.group(2)
-        try:
-            lat_f, lon_f = float(lat), float(lon)
-            if lat_f > 90 or lon_f > 180 or lat_f < 1 or lon_f < 1:
-                lat, lon = "", ""
-        except ValueError:
-            lat, lon = "", ""
-    if not lat or not lon:
-        for m in re.finditer(r'"lat":\s*([\d.]+).*?"lon":\s*([\d.]+)', html, re.DOTALL):
-            lat, lon = m.group(1), m.group(2)
-            break
-        if not lat and re.search(r'"lon":\s*([\d.]+).*?"lat":\s*([\d.]+)', html, re.DOTALL):
-            m = re.search(r'"lon":\s*([\d.]+).*?"lat":\s*([\d.]+)', html, re.DOTALL)
-            if m:
-                lon, lat = m.group(1), m.group(2)
-
-    address = ""
-    m = re.search(r'[А-Яа-яёЁ0-9\s\-\.]+(?:проспект|ул\.|улица|набережная|шоссе|переулок|бульвар)[^<]+', html)
+def _parse_coords_from_og_image(html: str) -> tuple[str, str]:
+    """
+    Извлекает координаты из og:image URL вида:
+    https://...?center=76.886196%2C43.202011&...
+    или markers=...lon,lat...
+    """
+    # og:image содержит center=lon%2Clat или center=lon,lat
+    m = re.search(r'og:image[^>]+content="[^"]*[?&]center=([0-9.]+)[%2C,]+([0-9.]+)', html)
     if m:
-        address = re.sub(r"\s+", " ", m.group(0)).strip()
-    if not address:
-        m = re.search(r'(\d+)\s*этаж', html)
+        lon, lat = m.group(1), m.group(2)
+        try:
+            if 40.0 < float(lat) < 56.0 and 50.0 < float(lon) < 90.0:
+                return lat, lon
+        except ValueError:
+            pass
+    # markers=lon|lat или markers=lon,lat
+    m = re.search(r'markers=([0-9.]+)[%2C,|]+([0-9.]+)', html)
+    if m:
+        lon, lat = m.group(1), m.group(2)
+        try:
+            if 40.0 < float(lat) < 56.0 and 50.0 < float(lon) < 90.0:
+                return lat, lon
+        except ValueError:
+            pass
+    return "", ""
+
+
+def parse_firm_page(html: str) -> tuple[str, str, str, str, dict[str, str]]:
+    """
+    Возвращает (address, lat, lon, phone, socials_dict).
+    Использует <title> и og:image для надёжного извлечения данных.
+    Формат title: "Название, категория, Адрес, Город в 2ГИС"
+    """
+    # Адрес из <title>: "Caelum Flowers, салон цветов, улица Навои, 308А, Алматы в 2ГИС"
+    address = ""
+    title_m = re.search(r'<title[^>]*>([^<]+)</title>', html)
+    if title_m:
+        title = title_m.group(1).strip()
+        # Убираем суффикс " в 2ГИС" / " — 2ГИС"
+        title = re.sub(r'\s*[—\-–]\s*2ГИС.*$', '', title)
+        title = re.sub(r'\s+в\s+2ГИС.*$', '', title)
+        # Разбиваем по запятой: [Название, категория, часть адреса, ...]
+        parts = [p.strip() for p in title.split(",")]
+        # Адрес — всё начиная с 3-й части (индекс 2), кроме последней (город)
+        if len(parts) >= 4:
+            address = ", ".join(parts[2:-1]).strip()
+        elif len(parts) == 3:
+            address = parts[2].strip()
+
+    # Координаты из og:image (самый надёжный источник)
+    lat, lon = _parse_coords_from_og_image(html)
+
+    # Fallback координаты из JSON в HTML
+    if not lat or not lon:
+        m = re.search(r'"point"\s*:\s*\{"lon"\s*:\s*([\d.]+)\s*,\s*"lat"\s*:\s*([\d.]+)', html)
         if m:
-            pos = html.find(m.group(0))
-            chunk = html[max(0, pos - 200):pos]
-            for part in re.findall(r"[А-Яа-яёЁ0-9\s\-\.]+", chunk):
-                if re.search(r"(улица|проспект|набережная|шоссе)", part) and len(part) > 10:
-                    address = part.strip()
-                    break
+            lon_v, lat_v = m.group(1), m.group(2)
+            try:
+                if 40.0 < float(lat_v) < 56.0 and 50.0 < float(lon_v) < 90.0:
+                    lat, lon = lat_v, lon_v
+            except ValueError:
+                pass
+    if not lat or not lon:
+        m = re.search(r'"lat"\s*:\s*([\d.]+)\s*,\s*"lon"\s*:\s*([\d.]+)', html)
+        if m:
+            lat_v, lon_v = m.group(1), m.group(2)
+            try:
+                if 40.0 < float(lat_v) < 56.0 and 50.0 < float(lon_v) < 90.0:
+                    lat, lon = lat_v, lon_v
+            except ValueError:
+                pass
+
     socials = _extract_social_links(html)
     phone = _extract_phone(html)
     return (address, lat, lon, phone, socials)
