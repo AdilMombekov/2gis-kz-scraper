@@ -31,8 +31,8 @@ _RETRYABLE_ERRORS = (
     OSError,
 )
 _MAX_RETRIES = 7
-_MAX_CELL_CHARS = 50000
-_TRUNCATION_SUFFIX = "... [TRUNCATED]"
+_MAX_CELL_CHARS = 49000
+_TRUNCATION_SUFFIX = "...[TRUNCATED]"
 
 
 def _retry(fn, *args, **kwargs):
@@ -149,7 +149,7 @@ def _sanitize_cell_value(value: object) -> tuple[str, bool]:
     if len(s) <= _MAX_CELL_CHARS:
         return s, False
 
-    keep = max(0, _MAX_CELL_CHARS - len(_TRUNCATION_SUFFIX))
+    keep = _MAX_CELL_CHARS - len(_TRUNCATION_SUFFIX)
     return s[:keep] + _TRUNCATION_SUFFIX, True
 
 
