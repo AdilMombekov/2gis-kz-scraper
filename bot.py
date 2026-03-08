@@ -40,11 +40,11 @@ except ImportError:
     raise ImportError("Установите: pip install pyTelegramBotAPI")
 
 from parser_2gis import (
-    BASE_2GIS_KZ, CITIES_KZ, FLOWER_QUERIES_KZ,
+    BASE_2GIS_KZ, CITIES_KZ, FLOWER_QUERIES_KZ, STOM_QUERIES_KZ,
     get_search_page, parse_search_results,
     search_via_api, parse_api_results,
     _fetch_firm_data, read_log_since,
-    is_flower_shop, _write_log_entry,
+    is_flower_shop, is_dental_clinic, _write_log_entry,
 )
 from google_sheets import (
     _get_service, get_spreadsheet_id,
@@ -67,18 +67,22 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
-# ── Состояние парсера ──────────────────────────────────────────────────────
-_state = {
-    "running": False,
-    "stop_flag": False,
-    "total_new": 0,
-    "total_in_sheet": 0,
-    "current_city": "",
-    "cities_done": 0,
-    "cities_total": len(CITIES_KZ),
-    "started_at": None,
-    "thread": None,
-}
+# ── Состояние парсеров ─────────────────────────────────────────────────────
+def _make_state():
+    return {
+        "running": False,
+        "stop_flag": False,
+        "total_new": 0,
+        "total_in_sheet": 0,
+        "current_city": "",
+        "cities_done": 0,
+        "cities_total": len(CITIES_KZ),
+        "started_at": None,
+        "thread": None,
+    }
+
+_state = _make_state()        # цветочный парсер
+_state_stom = _make_state()   # стоматологический парсер
 _state_lock = threading.Lock()
 
 
@@ -89,10 +93,11 @@ def _allowed(message) -> bool:
     return True
 
 
-def _elapsed() -> str:
-    if not _state["started_at"]:
+def _elapsed(state: dict | None = None) -> str:
+    st = state if state is not None else _state
+    if not st["started_at"]:
         return ""
-    secs = int(time.time() - _state["started_at"])
+    secs = int(time.time() - st["started_at"])
     m, s = divmod(secs, 60)
     h, m = divmod(m, 60)
     if h:
@@ -102,8 +107,23 @@ def _elapsed() -> str:
     return f"{s}с"
 
 
-# ── Парсер в отдельном потоке ──────────────────────────────────────────────
-def _run_scraper(chat_id: int):
+# ── Универсальный парсер ───────────────────────────────────────────────────
+def _run_generic_scraper(
+    chat_id: int,
+    state: dict,
+    sheet_name: str,
+    queries: list,
+    item_filter,
+    label: str,
+):
+    """
+    Универсальный парсер для любой категории.
+    state    — словарь состояния (_state или _state_stom)
+    sheet_name — имя листа в Google Sheets ("Data" или "Stom")
+    queries  — список поисковых запросов
+    item_filter — функция(name) -> bool для фильтрации
+    label    — название категории для логов
+    """
     def log(msg: str):
         try:
             bot.send_message(chat_id, msg)
@@ -112,23 +132,23 @@ def _run_scraper(chat_id: int):
 
     try:
         with _state_lock:
-            _state["running"] = True
-            _state["stop_flag"] = False
-            _state["total_new"] = 0
-            _state["cities_done"] = 0
-            _state["started_at"] = time.time()
+            state["running"] = True
+            state["stop_flag"] = False
+            state["total_new"] = 0
+            state["cities_done"] = 0
+            state["started_at"] = time.time()
 
         service = _get_service()
         spreadsheet_id = get_spreadsheet_id()
-        sheet = get_or_create_safe_sheet(service, spreadsheet_id, "Data")
+        sheet = get_or_create_safe_sheet(service, spreadsheet_id, sheet_name)
         ensure_header(service, spreadsheet_id, sheet)
 
-        log("Загружаю существующие ID из таблицы...")
+        log(f"Загружаю существующие ID из листа {sheet_name}...")
         seen_ids = get_existing_ids(service, spreadsheet_id, sheet)
         with _state_lock:
-            _state["total_in_sheet"] = len(seen_ids)
+            state["total_in_sheet"] = len(seen_ids)
         log(f"Уже в таблице: {len(seen_ids)} записей\nНачинаю парсинг {len(CITIES_KZ)} городов...")
-        _write_log_entry({"event": "start", "cities": len(CITIES_KZ), "queries": len(FLOWER_QUERIES_KZ)})
+        _write_log_entry({"event": "start", "sheet": sheet_name, "cities": len(CITIES_KZ), "queries": len(queries)})
 
         city_list = list(CITIES_KZ.items())
         city_slug_by_city = dict(city_list)
@@ -137,7 +157,7 @@ def _run_scraper(chat_id: int):
         total_written = 0
 
         def stopped():
-            return _state["stop_flag"]
+            return state["stop_flag"]
 
         def enrich_and_write(batch):
             nonlocal total_written
@@ -158,13 +178,13 @@ def _run_scraper(chat_id: int):
             written = append_rows(service, spreadsheet_id, batch, sheet)
             total_written += written
             with _state_lock:
-                _state["total_new"] = total_written
-                _state["total_in_sheet"] = len(seen_ids)
+                state["total_new"] = total_written
+                state["total_in_sheet"] = len(seen_ids)
 
         def scrape_city(city_name, city_slug):
             results = []
             seen_local = set()
-            for query in FLOWER_QUERIES_KZ:
+            for query in queries:
                 if stopped():
                     break
                 for page in range(1, MAX_PAGES + 1):
@@ -178,7 +198,7 @@ def _run_scraper(chat_id: int):
                     if not chunk:
                         break
                     for item in chunk:
-                        if item["id_2gis"] not in seen_local and is_flower_shop(item["name"]):
+                        if item["id_2gis"] not in seen_local and item_filter(item["name"]):
                             seen_local.add(item["id_2gis"])
                             item.setdefault("phone", "")
                             results.append(item)
@@ -208,46 +228,58 @@ def _run_scraper(chat_id: int):
                             new_buffer.append(item)
 
                 with _state_lock:
-                    _state["cities_done"] += 1
-                    _state["current_city"] = city_name
+                    state["cities_done"] += 1
+                    state["current_city"] = city_name
 
-                log(f"✅ {city_name}: +{len(new_items)} новых | буфер: {len(new_buffer)} | время: {_elapsed()}")
-                _write_log_entry({"event": "city_done", "city": city_name, "added": len(new_items), "found": len(items)})
+                log(f"✅ {city_name}: +{len(new_items)} новых | буфер: {len(new_buffer)} | время: {_elapsed(state)}")
+                _write_log_entry({"event": "city_done", "sheet": sheet_name, "city": city_name, "added": len(new_items), "found": len(items)})
 
                 if len(new_buffer) >= BATCH_SIZE:
                     batch = list(new_buffer)
                     new_buffer.clear()
-                    log(f"💾 Записываю {len(batch)} записей в таблицу...")
+                    log(f"💾 Записываю {len(batch)} записей в таблицу {sheet_name}...")
                     enrich_and_write(batch)
                     log(f"✔️ Записано. Всего новых: {total_written}")
 
-        # Финальный сброс
         if new_buffer and not stopped():
             log(f"💾 Финальная запись {len(new_buffer)} записей...")
             enrich_and_write(list(new_buffer))
             new_buffer.clear()
 
         sid = get_spreadsheet_id()
-        _write_log_entry({"event": "finish", "total": total_written, "stopped": stopped()})
+        _write_log_entry({"event": "finish", "sheet": sheet_name, "total": total_written, "stopped": stopped()})
         if stopped():
             log(f"🛑 Остановлено вручную.\nЗаписано новых: {total_written}\nhttps://docs.google.com/spreadsheets/d/{sid}")
         else:
-            log(f"🎉 Готово! Записано новых: {total_written}\nВремя: {_elapsed()}\nhttps://docs.google.com/spreadsheets/d/{sid}")
+            log(f"🎉 [{label}] Готово! Записано новых: {total_written}\nВремя: {_elapsed(state)}\nhttps://docs.google.com/spreadsheets/d/{sid}")
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"CRITICAL ERROR in _run_scraper: {e}\n{tb}", flush=True)
+        print(f"CRITICAL ERROR in scraper [{label}]: {e}\n{tb}", flush=True)
         try:
-            # Отправляем полный трейсбек частями по 3000 символов
-            full_msg = f"❌ Критическая ошибка:\n{e}\n\n{tb}"
+            full_msg = f"❌ Критическая ошибка [{label}]:\n{e}\n\n{tb}"
             for i in range(0, min(len(full_msg), 9000), 3000):
                 bot.send_message(chat_id, full_msg[i:i+3000])
         except Exception:
             pass
     finally:
         with _state_lock:
-            _state["running"] = False
-            _state["stop_flag"] = False
+            state["running"] = False
+            state["stop_flag"] = False
+
+
+def _run_scraper(chat_id: int):
+    _run_generic_scraper(
+        chat_id, _state, "Data",
+        FLOWER_QUERIES_KZ, is_flower_shop, "Цветы",
+    )
+
+
+def _run_scraper_stom(chat_id: int):
+    _run_generic_scraper(
+        chat_id, _state_stom, "Stom",
+        STOM_QUERIES_KZ, is_dental_clinic, "Стоматологии",
+    )
 
 
 # ── Команды бота ───────────────────────────────────────────────────────────
@@ -256,19 +288,23 @@ def cmd_start(message):
     if not _allowed(message):
         return
     bot.reply_to(message, (
-        "🌸 2GIS KZ Flower Scraper\n\n"
-        "Команды:\n"
-        "/run — запустить полный парсинг\n"
-        "       (существующие записи пропускаются)\n"
-        "/fix — дозаполнить пустые координаты/телефон\n"
-        "/stop — остановить парсинг\n"
-        "/status — текущий статус\n"
-        "/count — кол-во записей в таблице\n"
+        "🌸 2GIS KZ Scraper\n\n"
+        "── Цветочные (лист Data) ──\n"
+        "/run — запустить парсинг цветочных\n"
+        "/stop — остановить\n"
+        "/status — статус\n"
+        "/count — кол-во записей\n"
+        "/clear — очистить лист Data\n"
+        "/fix — дозаполнить пустые координаты/телефон\n\n"
+        "── Стоматологии (лист Stom) ──\n"
+        "/runstom — запустить парсинг стоматологий\n"
+        "/stopstom — остановить\n"
+        "/statusstom — статус\n"
+        "/countstom — кол-во записей\n"
+        "/clearstom — очистить лист Stom\n\n"
+        "── Общее ──\n"
         "/sheet — ссылка на таблицу\n"
-        "/clear — очистить таблицу\n"
-        "/log2h — что добавлено за последние 2 часа\n"
-        "/log5h — что добавлено за последние 5 часов\n"
-        "/log10h — что добавлено за последние 10 часов\n"
+        "/log2h /log5h /log10h — лог добавлений\n"
         "/help — эта справка"
     ))
 
@@ -279,11 +315,11 @@ def cmd_run(message):
         return
     with _state_lock:
         if _state["running"]:
-            bot.reply_to(message, "⚙️ Парсинг уже запущен. /status — посмотреть прогресс.")
+            bot.reply_to(message, "⚙️ Парсинг цветочных уже запущен. /status — посмотреть прогресс.")
             return
 
     bot.reply_to(message, (
-        f"🚀 Запускаю парсинг...\n"
+        f"🌸 Запускаю парсинг цветочных (лист Data)...\n"
         f"Городов: {len(CITIES_KZ)}, Запросов: {len(FLOWER_QUERIES_KZ)}\n"
         f"Страниц/запрос: {MAX_PAGES}, Потоков: {MAX_WORKERS}\n"
         f"Буду писать в таблицу батчами по {BATCH_SIZE} записей."
@@ -295,16 +331,50 @@ def cmd_run(message):
     t.start()
 
 
+@bot.message_handler(commands=["runstom"])
+def cmd_run_stom(message):
+    if not _allowed(message):
+        return
+    with _state_lock:
+        if _state_stom["running"]:
+            bot.reply_to(message, "⚙️ Парсинг стоматологий уже запущен. /statusstom — посмотреть прогресс.")
+            return
+
+    bot.reply_to(message, (
+        f"🦷 Запускаю парсинг стоматологий (лист Stom)...\n"
+        f"Городов: {len(CITIES_KZ)}, Запросов: {len(STOM_QUERIES_KZ)}\n"
+        f"Страниц/запрос: {MAX_PAGES}, Потоков: {MAX_WORKERS}\n"
+        f"Буду писать в таблицу батчами по {BATCH_SIZE} записей."
+    ))
+
+    t = threading.Thread(target=_run_scraper_stom, args=(message.chat.id,), daemon=True)
+    with _state_lock:
+        _state_stom["thread"] = t
+    t.start()
+
+
 @bot.message_handler(commands=["stop"])
 def cmd_stop(message):
     if not _allowed(message):
         return
     with _state_lock:
         if not _state["running"]:
-            bot.reply_to(message, "Парсинг не запущен.")
+            bot.reply_to(message, "Парсинг цветочных не запущен.")
             return
         _state["stop_flag"] = True
-    bot.reply_to(message, "🛑 Отправлен сигнал остановки. Подожди завершения текущего города...")
+    bot.reply_to(message, "🛑 Отправлен сигнал остановки цветочных. Подожди завершения текущего города...")
+
+
+@bot.message_handler(commands=["stopstom"])
+def cmd_stop_stom(message):
+    if not _allowed(message):
+        return
+    with _state_lock:
+        if not _state_stom["running"]:
+            bot.reply_to(message, "Парсинг стоматологий не запущен.")
+            return
+        _state_stom["stop_flag"] = True
+    bot.reply_to(message, "🛑 Отправлен сигнал остановки стоматологий. Подожди завершения текущего города...")
 
 
 @bot.message_handler(commands=["status"])
@@ -321,14 +391,38 @@ def cmd_status(message):
 
     if running:
         bot.reply_to(message, (
-            f"⚙️ Парсинг идёт\n"
+            f"⚙️ [Цветы] Парсинг идёт\n"
             f"Городов: {done}/{total}\n"
             f"Последний: {city}\n"
             f"Записано новых: {new}\n"
             f"Время: {elapsed}"
         ))
     else:
-        bot.reply_to(message, f"💤 Парсинг не запущен.\nПоследний раз записано: {new} новых за {elapsed}")
+        bot.reply_to(message, f"💤 [Цветы] Парсинг не запущен.\nПоследний раз записано: {new} новых за {elapsed}")
+
+
+@bot.message_handler(commands=["statusstom"])
+def cmd_status_stom(message):
+    if not _allowed(message):
+        return
+    with _state_lock:
+        running = _state_stom["running"]
+        new = _state_stom["total_new"]
+        done = _state_stom["cities_done"]
+        total = _state_stom["cities_total"]
+        city = _state_stom["current_city"]
+        elapsed = _elapsed()
+
+    if running:
+        bot.reply_to(message, (
+            f"⚙️ [Стоматологии] Парсинг идёт\n"
+            f"Городов: {done}/{total}\n"
+            f"Последний: {city}\n"
+            f"Записано новых: {new}\n"
+            f"Время: {elapsed}"
+        ))
+    else:
+        bot.reply_to(message, f"💤 [Стоматологии] Парсинг не запущен.\nПоследний раз записано: {new} новых за {elapsed}")
 
 
 @bot.message_handler(commands=["count"])
@@ -344,7 +438,25 @@ def cmd_count(message):
             spreadsheetId=sid, range=f"'{sheet}'!A:A"
         ).execute()
         rows = result.get("values", [])
-        bot.reply_to(message, f"📊 Записей в таблице: {len(rows) - 1}")
+        bot.reply_to(message, f"📊 [Цветы / Data] Записей: {len(rows) - 1}")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+
+@bot.message_handler(commands=["countstom"])
+def cmd_count_stom(message):
+    if not _allowed(message):
+        return
+    bot.reply_to(message, "⏳ Считаю...")
+    try:
+        service = _get_service()
+        sid = get_spreadsheet_id()
+        sheet = get_or_create_safe_sheet(service, sid, "Stom")
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sid, range=f"'{sheet}'!A:A"
+        ).execute()
+        rows = result.get("values", [])
+        bot.reply_to(message, f"📊 [Стоматологии / Stom] Записей: {len(rows) - 1}")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
@@ -366,9 +478,9 @@ def cmd_clear(message):
         return
     with _state_lock:
         if _state["running"]:
-            bot.reply_to(message, "⚠️ Нельзя очистить во время парсинга. Сначала /stop")
+            bot.reply_to(message, "⚠️ Нельзя очистить во время парсинга цветочных. Сначала /stop")
             return
-    bot.reply_to(message, "⏳ Очищаю таблицу...")
+    bot.reply_to(message, "⏳ Очищаю лист Data...")
     try:
         service = _get_service()
         sid = get_spreadsheet_id()
@@ -376,7 +488,28 @@ def cmd_clear(message):
         service.spreadsheets().values().clear(
             spreadsheetId=sid, range=f"'{sheet}'!A2:Z"
         ).execute()
-        bot.reply_to(message, "✅ Таблица очищена. Заголовок сохранён.")
+        bot.reply_to(message, "✅ Лист Data очищен. Заголовок сохранён.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+
+@bot.message_handler(commands=["clearstom"])
+def cmd_clear_stom(message):
+    if not _allowed(message):
+        return
+    with _state_lock:
+        if _state_stom["running"]:
+            bot.reply_to(message, "⚠️ Нельзя очистить во время парсинга стоматологий. Сначала /stopstom")
+            return
+    bot.reply_to(message, "⏳ Очищаю лист Stom...")
+    try:
+        service = _get_service()
+        sid = get_spreadsheet_id()
+        sheet = get_or_create_safe_sheet(service, sid, "Stom")
+        service.spreadsheets().values().clear(
+            spreadsheetId=sid, range=f"'{sheet}'!A2:Z"
+        ).execute()
+        bot.reply_to(message, "✅ Лист Stom очищен. Заголовок сохранён.")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
